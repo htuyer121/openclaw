@@ -1,4 +1,5 @@
 /** Worker-thread entrypoint for complete model-catalog discovery. */
+import path from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { normalizeProviderId } from "@openclaw/model-catalog-core/provider-id";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
@@ -19,7 +20,6 @@ import { captureProviderCatalogExpiries } from "../plugins/provider-catalog-expi
 import { planRuntimePluginDiscovery } from "../plugins/provider-discovery.js";
 import { restorePreparedSyntheticAuthFacts } from "../plugins/provider-synthetic-auth.js";
 import { manifestPluginResolvesRuntimeModelCatalogAugment } from "../plugins/providers.js";
-import type { PluginRegistry } from "../plugins/registry-types.js";
 import { withPluginRuntimeGenerationScope } from "../plugins/runtime/generation-scope.js";
 import { resolveRuntimeSyntheticAuthProviderRefs } from "../plugins/synthetic-auth.runtime.js";
 import { normalizeAgentId } from "../routing/session-key.js";
@@ -34,6 +34,8 @@ import {
   resolveRegisteredAgentIdForDir,
   unregisterResolvedAgentDir,
 } from "./agent-dir-registry.js";
+import { listAgentIds } from "./agent-roster.js";
+import { resolveEffectiveAgentDir } from "./agent-scope-config.js";
 import { overlayExternalAuthProfiles } from "./auth-profiles/external-auth-runtime.js";
 import { listExternalCliSyncProviderIds } from "./auth-profiles/external-cli-sync.js";
 import { mergeRuntimeExternalProfileReferences } from "./auth-profiles/runtime-external-profile-references.js";
@@ -42,6 +44,15 @@ import { loadAuthProfileStoreWithoutExternalProfiles } from "./auth-profiles/sto
 import { preserveResolvedSecretBackedCredentials } from "./auth-profiles/store.js";
 import { prepareModelCatalogAuthLabels } from "./model-catalog-auth-labels.js";
 import { resolveImplicitProviderDiscoveryScope } from "./models-config.providers.discovery-scope.js";
+import {
+  commitWorkerDiscovery,
+  releaseWorkerDiscoveries,
+  releaseWorkerDiscovery,
+  retainWorkerGeneration,
+  workerDiscoveries,
+  type WorkerDiscovery,
+  type WorkerGeneration,
+} from "./prepared-model-catalog-worker.generations.js";
 import {
   PREPARED_MODEL_CATALOG_WORKER_TIMEOUT_MS,
   fingerprintPreparedModelCatalogGeneration,
@@ -52,28 +63,16 @@ import {
   type PreparedModelWorkerRequest,
   type PreparedModelWorkerResult,
 } from "./prepared-model-catalog-worker.js";
-import type { PreparedModelRuntimeAgentFacts } from "./prepared-model-runtime.catalog-contract.js";
+import { fingerprintPreparedRuntimeFacts } from "./prepared-model-runtime.facts.js";
 import { prepareOwnedPluginLoadContext } from "./prepared-model-runtime.plugin-context.js";
 import {
   discardPreparedPluginGeneration,
-  ownPreparedPluginGeneration,
   retainPreparedPluginRegistry,
 } from "./prepared-model-runtime.plugin-lifetime.js";
 import { PreparedModelRuntimeBuildResources } from "./prepared-model-runtime.resources.js";
 import { scopeSyntheticAuthProviderRefs } from "./prepared-model-runtime.synthetic-auth.js";
 import type { PreparedModelRuntimePluginGeneration } from "./prepared-model-runtime.types.js";
 import { AuthStorage } from "./sessions/auth-storage.js";
-
-type WorkerGeneration = {
-  agentFacts: PreparedModelRuntimeAgentFacts;
-  pluginGeneration: PreparedModelRuntimePluginGeneration;
-  reconstructedFingerprint: string;
-  discovery?: {
-    key: string;
-    registry: PluginRegistry;
-    release: () => Promise<void>;
-  };
-};
 
 function refreshAuthStore(params: {
   agentDir: string;
@@ -211,7 +210,8 @@ async function runCatalogRequest(
     : undefined;
   let registeredDirectoryOwner = false;
   let prepared: WorkerGeneration | undefined;
-  let acquiredDiscovery: WorkerGeneration["discovery"];
+  let acquiredDiscovery: WorkerDiscovery | undefined;
+  let usedDiscovery: typeof acquiredDiscovery;
   let completed = false;
   try {
     if (directoryOwner) {
@@ -353,7 +353,8 @@ async function runCatalogRequest(
         ]),
       ].toSorted();
       const key = JSON.stringify(pluginIds);
-      if (prepared.discovery?.key !== key) {
+      usedDiscovery = workerDiscoveries(prepared).get(key);
+      if (!usedDiscovery) {
         await using resources = new PreparedModelRuntimeBuildResources(
           retainPreparedPluginRegistry,
         );
@@ -377,7 +378,8 @@ async function runCatalogRequest(
           },
         };
       }
-      const catalogRegistry = (acquiredDiscovery ?? prepared.discovery)!.registry;
+      usedDiscovery = acquiredDiscovery ?? usedDiscovery;
+      const catalogRegistry = usedDiscovery!.registry;
       prepareOwnedPluginLoadContext(
         value.input,
         value.input.env ?? process.env,
@@ -472,10 +474,8 @@ async function runCatalogRequest(
     };
     work.beginClose();
     await work.runWhenIdle(() => undefined);
-    if (acquiredDiscovery) {
-      const previous = prepared.discovery;
-      prepared.discovery = acquiredDiscovery;
-      await previous?.release();
+    if (usedDiscovery) {
+      await commitWorkerDiscovery(prepared, usedDiscovery);
     }
     completed = true;
     return result;
@@ -491,14 +491,15 @@ async function runCatalogRequest(
       work.beginClose();
       await work.runWhenIdle(() => undefined);
       if (acquiredDiscovery && !completed) {
-        if (prepared?.discovery === acquiredDiscovery) {
-          prepared.discovery = undefined;
+        const cache = prepared && workerDiscoveries(prepared);
+        if (cache?.get(acquiredDiscovery.key) === acquiredDiscovery) {
+          cache.delete(acquiredDiscovery.key);
         }
-        await acquiredDiscovery.release();
+        await releaseWorkerDiscovery(acquiredDiscovery);
       }
       if (prepared && !prepareGeneration) {
         try {
-          await prepared.discovery?.release();
+          await releaseWorkerDiscoveries(prepared);
         } finally {
           await discardPreparedPluginGeneration(prepared.pluginGeneration);
         }
@@ -533,26 +534,14 @@ function isWorkerRequest(value: unknown): value is PreparedModelWorkerRequest {
   );
 }
 
-// Keep custody outside the request scope: an inline closure also retains `previous`,
-// chaining every superseded generation through the worker's one current entry.
-function retainWorkerGeneration(prepared: WorkerGeneration): () => Promise<void> {
-  const releaseBase = ownPreparedPluginGeneration(prepared.pluginGeneration).retain();
-  return async () => {
-    try {
-      await prepared.discovery?.release();
-    } finally {
-      await releaseBase();
-    }
-  };
-}
-
-if (parentPort) {
-  const data = workerData as PreparedModelCatalogWorkerData;
-  // Serial worker tasks share one successful generation, including across fleet changes.
-  let current:
-    | { fingerprint: string; prepared: WorkerGeneration; release: () => Promise<void> }
-    | undefined;
-  serveWorkerTasks(async (input) => {
+/** Serial tasks retain at most one successful base generation per configured agent. */
+export function createPreparedCatalogTaskHandler(data: PreparedModelCatalogWorkerData) {
+  const slots = new Map<
+    string,
+    { fingerprint: string; prepared: WorkerGeneration; release: () => Promise<void> }
+  >();
+  let epoch: string | undefined;
+  return async (input: unknown): Promise<PreparedModelWorkerResult> => {
     // SAFETY: The Gateway pool is the sole producer of this private task envelope.
     const task = data.kind === "gateway" ? (input as PreparedModelCatalogWorkerTask) : undefined;
     const value = task?.value ?? data;
@@ -563,7 +552,51 @@ if (parentPort) {
     return withPluginSourceCaptureDirectory(
       data.sourceCaptureDirectory,
       async () => {
-        const previous = current;
+        // The parent pool owns plugin-inventory retirement. Config/environment
+        // changes must also retire agents that no longer send requests here.
+        const nextEpoch = fingerprintPreparedRuntimeFacts([
+          value.input.config,
+          value.sourceConfigForSecrets,
+          value.configResolutionFacts,
+          value.sourceConfigResolutionFacts,
+          value.input.env,
+          value.preferBuiltPluginArtifacts,
+        ]);
+        if (epoch !== nextEpoch) {
+          // Detach all old slots before disposal. Failed cleanup must not leave
+          // another agent's stale generation available to a subsequent request.
+          const stale = [...slots.values()];
+          slots.clear();
+          epoch = nextEpoch;
+          const failures: unknown[] = [];
+          for (const owner of stale) {
+            try {
+              await owner.release();
+            } catch (error) {
+              failures.push(error);
+            }
+          }
+          if (failures.length) {
+            throw new AggregateError(failures, "Catalog agent generations failed to retire");
+          }
+        }
+        let key = data.kind === "gateway" ? undefined : "standalone";
+        if (data.kind === "gateway") {
+          try {
+            const agentId = value.input.agentId && normalizeAgentId(value.input.agentId);
+            if (agentId && listAgentIds(value.input.config).includes(agentId)) {
+              const canonicalDir = resolveEffectiveAgentDir(value.input.config, agentId, {
+                env: value.input.env,
+              });
+              if (path.resolve(canonicalDir) === path.resolve(value.input.agentDir)) {
+                key = agentId;
+              }
+            }
+          } catch {
+            // Cache admission is optional; the request still performs native validation.
+          }
+        }
+        const previous = key === undefined ? undefined : slots.get(key);
         let attempted: WorkerGeneration | undefined;
         let release: (() => Promise<void>) | undefined;
         try {
@@ -577,12 +610,12 @@ if (parentPort) {
             }
             return prepared;
           });
-          if (attempted && release && result.status === "ok") {
-            current = {
+          if (key !== undefined && attempted && release && result.status === "ok") {
+            slots.set(key, {
               fingerprint: value.generationFingerprint,
               prepared: attempted,
               release,
-            };
+            });
             attempted = undefined;
             release = undefined;
             // Acquire the replacement before releasing shared source registrations.
@@ -599,5 +632,9 @@ if (parentPort) {
       },
       data.sourceCaptureManagedRoot,
     );
-  });
+  };
+}
+
+if (parentPort) {
+  serveWorkerTasks(createPreparedCatalogTaskHandler(workerData as PreparedModelCatalogWorkerData));
 }
