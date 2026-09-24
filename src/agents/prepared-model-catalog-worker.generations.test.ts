@@ -58,7 +58,7 @@ describe("worker discovery retention", () => {
     const owner = generation("alpha");
     const entries = ["a", "b", "c", "d", "e", "f"].map(discovery);
     for (const entry of entries) {
-      await commitWorkerDiscovery(owner.prepared, entry);
+      commitWorkerDiscovery(owner.prepared, entry);
       await cache.commit("alpha", owner);
     }
     expect([...workerDiscoveries(owner.prepared).keys()]).toEqual(entries.map(({ key }) => key));
@@ -75,17 +75,17 @@ describe("worker discovery retention", () => {
     const beta = generation("beta");
     const [a, b, c, d] = ["a", "b", "c", "d"].map(discovery);
     for (const entry of [a!, b!]) {
-      await commitWorkerDiscovery(alpha.prepared, entry);
+      commitWorkerDiscovery(alpha.prepared, entry);
       await cache.commit("alpha", alpha);
     }
-    await commitWorkerDiscovery(beta.prepared, c!);
+    commitWorkerDiscovery(beta.prepared, c!);
     await cache.commit("beta", beta);
-    await commitWorkerDiscovery(alpha.prepared, a!);
+    commitWorkerDiscovery(alpha.prepared, a!);
     await cache.commit("alpha", alpha);
     expect(workerDiscoveries(alpha.prepared).get("b")).toBe(b);
     expect(cache.get("beta")).toBe(beta);
     const releaseB = b!.release;
-    await commitWorkerDiscovery(beta.prepared, d!);
+    commitWorkerDiscovery(beta.prepared, d!);
     await cache.commit("beta", beta);
     expect(releaseB).toHaveBeenCalledTimes(1);
     expect([...workerDiscoveries(alpha.prepared).keys()]).toEqual(["a"]);
@@ -100,8 +100,8 @@ describe("worker discovery retention", () => {
     const second = {};
     const a = discovery("same-exact-scope");
     const b = discovery("same-exact-scope");
-    await commitWorkerDiscovery(first, a);
-    await commitWorkerDiscovery(second, b);
+    commitWorkerDiscovery(first, a);
+    commitWorkerDiscovery(second, b);
     await releaseWorkerDiscoveries(first);
     expect(workerDiscoveries(first).size).toBe(0);
     expect(workerDiscoveries(second).get(b.key)?.registry).toBe(b.registry);
@@ -118,7 +118,7 @@ describe("worker discovery retention", () => {
       throw new Error("retained native cleanup failure");
     });
     for (const entry of entries) {
-      await commitWorkerDiscovery(prepared, entry);
+      commitWorkerDiscovery(prepared, entry);
     }
     await expect(releaseWorkerDiscoveries(prepared)).rejects.toThrow(
       "Catalog discovery registries failed to retire",
@@ -142,9 +142,9 @@ describe("worker discovery retention", () => {
       expect(cache.get("beta")).toBe(beta);
       throw new Error("eviction failed");
     });
-    await commitWorkerDiscovery(alpha.prepared, a);
+    commitWorkerDiscovery(alpha.prepared, a);
     await cache.commit("alpha", alpha);
-    await commitWorkerDiscovery(beta.prepared, b);
+    commitWorkerDiscovery(beta.prepared, b);
     await expect(cache.commit("beta", beta)).rejects.toThrow(
       "Catalog worker registries failed to retire",
     );

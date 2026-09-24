@@ -476,7 +476,7 @@ async function runCatalogRequest(
     work.beginClose();
     await work.runWhenIdle(() => undefined);
     if (usedDiscovery) {
-      await commitWorkerDiscovery(prepared, usedDiscovery);
+      commitWorkerDiscovery(prepared, usedDiscovery);
     }
     completed = true;
     return result;

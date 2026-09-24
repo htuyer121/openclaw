@@ -26,7 +26,7 @@ export type WorkerGenerationOwner = {
 
 // Bound retained registrations across the whole worker, including base generations.
 // This is a settled cache bound, not a byte limit on plugin code or native ESM jobs.
-export const MAX_CATALOG_WORKER_REGISTRIES = 32;
+const MAX_CATALOG_WORKER_REGISTRIES = 32;
 const successfulUses = new WeakMap<WorkerGeneration | WorkerDiscovery, number>();
 let nextSuccessfulUse = 0;
 

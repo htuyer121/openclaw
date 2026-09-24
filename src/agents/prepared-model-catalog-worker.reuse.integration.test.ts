@@ -5,7 +5,6 @@ import { threadId } from "node:worker_threads";
 import { expect, it, vi } from "vitest";
 import { saveAuthProfileStore } from "./auth-profiles/store-runtime.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
-import { MAX_CATALOG_WORKER_REGISTRIES } from "./prepared-model-catalog-worker.generations.js";
 import { getPreparedModelCatalogWorkerPoolSnapshot } from "./prepared-model-catalog-worker.js";
 import {
   EXTERNAL_AUTH_PROFILE_ID,
@@ -260,9 +259,7 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
           if (fleetProof) {
             // This fixture shares one base source capture; each retained discovery
             // owns one additional capture. Real plugins may have different sizes.
-            expect(captureDirectories().length).toBeLessThanOrEqual(
-              MAX_CATALOG_WORKER_REGISTRIES + 1,
-            );
+            expect(captureDirectories().length).toBeLessThanOrEqual(33);
           }
         }
       }
