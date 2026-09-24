@@ -236,7 +236,11 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
         .split("\n")
         .map((line) => JSON.parse(line) as { provider: string; agentDir: string; threadId: number })
         .filter((execution) => execution.threadId !== threadId)
-        .map(({ provider, agentDir, threadId }) => ({ provider, agentDir, threadId }));
+        .map(({ provider, agentDir, threadId: workerThreadId }) => ({
+          provider,
+          agentDir,
+          threadId: workerThreadId,
+        }));
     const refreshScopes = async (revision: string) => {
       for (const provider of providerIds) {
         for (const [index, snapshot] of fixture.snapshots.entries()) {

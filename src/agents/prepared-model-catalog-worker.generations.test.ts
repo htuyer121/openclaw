@@ -62,7 +62,9 @@ describe("worker discovery retention", () => {
       await cache.commit("alpha", owner);
     }
     expect([...workerDiscoveries(owner.prepared).keys()]).toEqual(entries.map(({ key }) => key));
-    for (const entry of entries) expect(entry.release).not.toHaveBeenCalled();
+    for (const entry of entries) {
+      expect(entry.release).not.toHaveBeenCalled();
+    }
     expect(owner.release).not.toHaveBeenCalled();
     await cache.clear();
   });
@@ -108,20 +110,20 @@ describe("worker discovery retention", () => {
   });
 
   it("detaches every entry and drains other releases after a retirement failure", async () => {
-    const generation = {};
+    const prepared = {};
     const entries = ["a", "b", "c"].map(discovery);
     const releases = entries.map((entry) => entry.release);
     releases[0]!.mockImplementation(async () => {
-      expect(workerDiscoveries(generation).size).toBe(0);
+      expect(workerDiscoveries(prepared).size).toBe(0);
       throw new Error("retained native cleanup failure");
     });
     for (const entry of entries) {
-      await commitWorkerDiscovery(generation, entry);
+      await commitWorkerDiscovery(prepared, entry);
     }
-    await expect(releaseWorkerDiscoveries(generation)).rejects.toThrow(
+    await expect(releaseWorkerDiscoveries(prepared)).rejects.toThrow(
       "Catalog discovery registries failed to retire",
     );
-    await releaseWorkerDiscoveries(generation);
+    await releaseWorkerDiscoveries(prepared);
     for (const release of releases) {
       expect(release).toHaveBeenCalledTimes(1);
     }
