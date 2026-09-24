@@ -74,7 +74,10 @@ module.exports = { id: ${JSON.stringify(PROVIDER_ID)}, register(api) {
     ] as const) {
       vi.stubEnv(name, fixture.env[name]);
     }
-    const agentIds = ["fleet-a", "fleet-b", "fleet-c", "fleet-d"].slice(0, options.agentCount ?? 4);
+    const agentIds = Array.from(
+      { length: options.agentCount ?? 4 },
+      (_, index) => `fleet-${index < 26 ? String.fromCharCode(97 + index) : index + 1}`,
+    );
     const entries = Object.fromEntries(
       agentIds.map(
         (id) =>

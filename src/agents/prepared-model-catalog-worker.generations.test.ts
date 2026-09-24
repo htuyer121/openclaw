@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+import { createPluginMetadataSnapshotFixture } from "../plugins/plugin-metadata.test-support.js";
 import { createEmptyPluginRegistry } from "../plugins/registry-empty.js";
 import {
   commitWorkerDiscovery,
   releaseWorkerDiscoveries,
   releaseWorkerDiscovery,
   workerDiscoveries,
+  WorkerGenerationCache,
   type WorkerDiscovery,
   type WorkerGeneration,
 } from "./prepared-model-catalog-worker.generations.js";
+import { AuthStorage } from "./sessions/auth-storage.js";
 
 vi.mock("./prepared-model-runtime.plugin-lifetime.js", () => ({
   ownPreparedPluginGeneration: vi.fn(),
@@ -21,25 +24,73 @@ function discovery(key: string) {
   } satisfies WorkerDiscovery;
 }
 
+function generation(key: string) {
+  const prepared: WorkerGeneration = {
+    reconstructedFingerprint: key,
+    pluginGeneration: {
+      pluginMetadataSnapshot: createPluginMetadataSnapshotFixture(),
+      inlineProviderModels: [],
+      configuredCatalogEntries: [],
+    },
+    agentFacts: {
+      input: { agentDir: key, config: {} },
+      env: {},
+      authStore: { version: 1, profiles: {} },
+      templateAuthStorage: AuthStorage.inMemory({}),
+      credentials: {},
+      providerIds: [],
+      configuredModelRefs: [],
+      configuredRuntimeModels: [],
+      runtimeCapabilityModels: [],
+      configuredGeneratedCatalogPluginIds: [],
+    },
+  };
+  return {
+    fingerprint: key,
+    prepared,
+    release: vi.fn(async () => releaseWorkerDiscoveries(prepared)),
+  };
+}
+
 describe("worker discovery retention", () => {
-  it("keeps four exact scopes and retires the least recently successful one", async () => {
-    const generation: Pick<WorkerGeneration, "discoveries"> = {};
-    const entries = ["a", "b", "c", "d", "e"].map(discovery);
-    for (const entry of entries.slice(0, 4)) {
-      await commitWorkerDiscovery(generation, entry);
+  it("reuses more than four exact scopes within the worker-wide budget", async () => {
+    const cache = new WorkerGenerationCache(7);
+    const owner = generation("alpha");
+    const entries = ["a", "b", "c", "d", "e", "f"].map(discovery);
+    for (const entry of entries) {
+      await commitWorkerDiscovery(owner.prepared, entry);
+      await cache.commit("alpha", owner);
     }
-    const cache = workerDiscoveries(generation);
-    // An attempted read alone must not protect a failed request from eviction.
-    expect(cache.get("b")).toBe(entries[1]);
-    await commitWorkerDiscovery(generation, entries[0]!);
-    const releaseB = entries[1]!.release;
-    await commitWorkerDiscovery(generation, entries[4]!);
-    expect([...cache.keys()]).toEqual(["c", "d", "a", "e"]);
+    expect([...workerDiscoveries(owner.prepared).keys()]).toEqual(entries.map(({ key }) => key));
+    for (const entry of entries) expect(entry.release).not.toHaveBeenCalled();
+    expect(owner.release).not.toHaveBeenCalled();
+    await cache.clear();
+  });
+
+  it("evicts the oldest successful discovery across agents without promoting attempted reads", async () => {
+    const cache = new WorkerGenerationCache(5);
+    const alpha = generation("alpha");
+    const beta = generation("beta");
+    const [a, b, c, d] = ["a", "b", "c", "d"].map(discovery);
+    for (const entry of [a!, b!]) {
+      await commitWorkerDiscovery(alpha.prepared, entry);
+      await cache.commit("alpha", alpha);
+    }
+    await commitWorkerDiscovery(beta.prepared, c!);
+    await cache.commit("beta", beta);
+    await commitWorkerDiscovery(alpha.prepared, a!);
+    await cache.commit("alpha", alpha);
+    expect(workerDiscoveries(alpha.prepared).get("b")).toBe(b);
+    expect(cache.get("beta")).toBe(beta);
+    const releaseB = b!.release;
+    await commitWorkerDiscovery(beta.prepared, d!);
+    await cache.commit("beta", beta);
     expect(releaseB).toHaveBeenCalledTimes(1);
-    for (const index of [0, 2, 3, 4]) {
-      expect(entries[index]!.release).not.toHaveBeenCalled();
-    }
-    await releaseWorkerDiscoveries(generation);
+    expect([...workerDiscoveries(alpha.prepared).keys()]).toEqual(["a"]);
+    expect([...workerDiscoveries(beta.prepared).keys()]).toEqual(["c", "d"]);
+    expect(alpha.release).not.toHaveBeenCalled();
+    expect(beta.release).not.toHaveBeenCalled();
+    await cache.clear();
   });
 
   it("keeps identical scopes isolated between agent generations", async () => {
@@ -76,18 +127,47 @@ describe("worker discovery retention", () => {
     }
   });
 
-  it("detaches a failed eviction and never retries its release", async () => {
-    const generation = {};
-    const entries = ["a", "b", "c", "d", "e"].map(discovery);
-    const releaseA = entries[0]!.release;
-    releaseA.mockRejectedValue(new Error("eviction failed"));
-    for (const entry of entries.slice(0, 4)) {
-      await commitWorkerDiscovery(generation, entry);
-    }
-    await expect(commitWorkerDiscovery(generation, entries[4]!)).rejects.toThrow("eviction failed");
-    expect(workerDiscoveries(generation).has("a")).toBe(false);
-    await releaseWorkerDiscovery(entries[0]!);
-    await releaseWorkerDiscoveries(generation);
+  it("detaches every eviction before cleanup and drains the base after a child release fails", async () => {
+    const cache = new WorkerGenerationCache(2);
+    const alpha = generation("alpha");
+    const beta = generation("beta");
+    const a = discovery("a");
+    const b = discovery("b");
+    const releaseA = a.release;
+    releaseA.mockImplementation(async () => {
+      expect(cache.get("alpha")).toBeUndefined();
+      expect(workerDiscoveries(alpha.prepared).size).toBe(0);
+      expect(cache.get("beta")).toBe(beta);
+      throw new Error("eviction failed");
+    });
+    await commitWorkerDiscovery(alpha.prepared, a);
+    await cache.commit("alpha", alpha);
+    await commitWorkerDiscovery(beta.prepared, b);
+    await expect(cache.commit("beta", beta)).rejects.toThrow(
+      "Catalog worker registries failed to retire",
+    );
+    expect(alpha.release).toHaveBeenCalledTimes(1);
+    expect(beta.release).not.toHaveBeenCalled();
+    await releaseWorkerDiscovery(a);
+    await cache.clear();
     expect(releaseA).toHaveBeenCalledTimes(1);
+  });
+
+  it("publishes a replacement before releasing its predecessor and preserves the successor on failure", async () => {
+    const cache = new WorkerGenerationCache(2);
+    const old = generation("old");
+    const next = generation("next");
+    await cache.commit("alpha", old);
+    old.release.mockImplementation(async () => {
+      expect(cache.get("alpha")).toBe(next);
+      throw new Error("replacement release failed");
+    });
+    await expect(cache.commit("alpha", next)).rejects.toThrow(
+      "Catalog worker registries failed to retire",
+    );
+    await cache.commit("alpha", next);
+    expect(old.release).toHaveBeenCalledTimes(1);
+    expect(next.release).not.toHaveBeenCalled();
+    await cache.clear();
   });
 });

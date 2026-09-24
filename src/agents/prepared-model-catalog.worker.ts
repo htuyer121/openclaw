@@ -50,6 +50,7 @@ import {
   releaseWorkerDiscovery,
   retainWorkerGeneration,
   workerDiscoveries,
+  WorkerGenerationCache,
   type WorkerDiscovery,
   type WorkerGeneration,
 } from "./prepared-model-catalog-worker.generations.js";
@@ -534,12 +535,9 @@ function isWorkerRequest(value: unknown): value is PreparedModelWorkerRequest {
   );
 }
 
-/** Serial tasks retain at most one successful base generation per configured agent. */
+/** Serial tasks retain successful agent generations within one worker-wide registry budget. */
 export function createPreparedCatalogTaskHandler(data: PreparedModelCatalogWorkerData) {
-  const slots = new Map<
-    string,
-    { fingerprint: string; prepared: WorkerGeneration; release: () => Promise<void> }
-  >();
+  const slots = new WorkerGenerationCache();
   let epoch: string | undefined;
   return async (input: unknown): Promise<PreparedModelWorkerResult> => {
     // SAFETY: The Gateway pool is the sole producer of this private task envelope.
@@ -565,20 +563,8 @@ export function createPreparedCatalogTaskHandler(data: PreparedModelCatalogWorke
         if (epoch !== nextEpoch) {
           // Detach all old slots before disposal. Failed cleanup must not leave
           // another agent's stale generation available to a subsequent request.
-          const stale = [...slots.values()];
-          slots.clear();
           epoch = nextEpoch;
-          const failures: unknown[] = [];
-          for (const owner of stale) {
-            try {
-              await owner.release();
-            } catch (error) {
-              failures.push(error);
-            }
-          }
-          if (failures.length) {
-            throw new AggregateError(failures, "Catalog agent generations failed to retire");
-          }
+          await slots.clear();
         }
         let key = data.kind === "gateway" ? undefined : "standalone";
         if (data.kind === "gateway") {
@@ -611,15 +597,16 @@ export function createPreparedCatalogTaskHandler(data: PreparedModelCatalogWorke
             return prepared;
           });
           if (key !== undefined && attempted && release && result.status === "ok") {
-            slots.set(key, {
+            const owner = {
               fingerprint: value.generationFingerprint,
               prepared: attempted,
               release,
-            });
+            };
             attempted = undefined;
             release = undefined;
-            // Acquire the replacement before releasing shared source registrations.
-            await previous?.release();
+            await slots.commit(key, owner);
+          } else if (key !== undefined && previous && result.status === "ok") {
+            await slots.commit(key, previous);
           }
           return result;
         } finally {

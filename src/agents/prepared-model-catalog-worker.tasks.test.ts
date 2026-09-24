@@ -153,6 +153,36 @@ beforeEach(() => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("catalog worker task generation ownership", () => {
+  it("bounds retained generations across a larger fleet and rebuilds evicted agents", async () => {
+    const agentIds = Array.from({ length: 40 }, (_, index) => `agent-${index}`);
+    const fleetConfig: OpenClawConfig = {
+      agents: {
+        entries: Object.fromEntries(agentIds.map((id) => [id, { agentDir: agentDir(id) }])),
+      },
+    };
+    const fleetInput = (id: string) => {
+      const value = input(id);
+      value.input.config = fleetConfig;
+      return { ...value, sourceConfigForSecrets: fleetConfig };
+    };
+    const run = gatewayHandler();
+    for (let pass = 0; pass < 3; pass++) {
+      for (const id of agentIds) {
+        expect(await run(fleetInput(id))).toMatchObject({ status: "ok" });
+        expect(
+          releases().filter((release) => release.mock.calls.length === 0).length,
+        ).toBeLessThanOrEqual(32);
+      }
+    }
+    expect(mocks.prepare).toHaveBeenCalledTimes(120);
+    expect(releases()[0]).toHaveBeenCalledTimes(1);
+    const prepared = mocks.prepare.mock.calls.length;
+    expect(await run(fleetInput(agentIds.at(-1)!))).toMatchObject({ status: "ok" });
+    expect(mocks.prepare).toHaveBeenCalledTimes(prepared);
+    expect(await run(fleetInput(agentIds[0]!))).toMatchObject({ status: "ok" });
+    expect(mocks.prepare).toHaveBeenCalledTimes(prepared + 1);
+  });
+
   it("retains one generation per configured agent and replaces only that agent's fingerprint", async () => {
     const run = gatewayHandler();
     for (const agentId of ["alpha", "beta", "alpha", "beta"]) {
