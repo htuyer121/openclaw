@@ -61,6 +61,7 @@ async function createFixture() {
       onTransaction,
       postVerifyStep: undefined as UpdateParams["postVerifyStep"],
       timeoutMs: 1000,
+      workTimeoutMs: undefined as UpdateParams["workTimeoutMs"],
     },
   };
 }
@@ -71,6 +72,7 @@ async function runUpdate(
   fixture: Fixture,
   prepareCandidate: (packageRoot: string) => Promise<void>,
   runLifecycleStep?: UpdateParams["runStep"],
+  admission: Pick<UpdateParams, "beforeVerifyCandidate" | "resolveLifecycleNodeRunner"> = {},
 ) {
   const stages: { prefix: string; packageRoot: string; bytes: string[] }[] = [];
   const lifecycleCalls: string[] = [];
@@ -83,6 +85,7 @@ async function runUpdate(
   });
   const result = await runGlobalPackageUpdateSteps({
     ...fixture.params,
+    ...admission,
     runStep: async (step) => {
       if (step.name === "package-install") {
         const prefixIndex = step.argv.indexOf("--prefix");
@@ -147,6 +150,78 @@ async function writeUncertainLock(
 }
 
 describe("runGlobalPackageUpdateSteps lifecycle ownership", () => {
+  it.each([
+    ["legacy", undefined, 1000],
+    ["unbounded", null, undefined],
+    ["explicit", 5000, 5000],
+  ] as const)(
+    "carries the %s work budget to both lifecycle scripts",
+    async (_, workTimeoutMs, expectedTimeout) => {
+      const fixture = await createFixture();
+      fixture.params.workTimeoutMs = workTimeoutMs;
+      const scriptTimeouts: Array<number | undefined> = [];
+      const { result, lifecycleCalls } = await runUpdate(
+        fixture,
+        async () => {},
+        async (step) => {
+          scriptTimeouts.push(step.timeoutMs);
+          if (step.name === "npm-package-postinstall" && step.cwd) {
+            await fs.rm(path.join(step.cwd, PACKAGE_LIFECYCLE_PENDING_RELATIVE_PATH));
+          }
+          return {
+            name: step.name,
+            command: step.argv.join(" "),
+            cwd: step.cwd ?? fixture.packageRoot,
+            durationMs: 0,
+            exitCode: 0,
+          };
+        },
+      );
+      expect(result.failedStep).toBeNull();
+      expect(result.afterVersion).toBe("2.0.0");
+      expect(lifecycleCalls).toEqual(["npm-package-preinstall", "npm-package-postinstall"]);
+      expect(scriptTimeouts).toEqual([expectedTimeout, expectedTimeout]);
+    },
+  );
+  it("runs pending lifecycle only after admission with the newly selected Node runner", async () => {
+    const fixture = await createFixture();
+    const selectedNode = path.join(fixture.globalRoot, "selected-node");
+    let nodeRunner: string | undefined;
+    let admitted = false;
+    const { result, lifecycleCalls } = await runUpdate(
+      fixture,
+      async () => {},
+      async (step) => {
+        expect(admitted).toBe(true);
+        expect(step.argv[0]).toBe(selectedNode);
+        expect(step.env?.PATH?.split(path.delimiter)[0]).toBe(path.dirname(selectedNode));
+        if (step.name === "npm-package-postinstall" && step.cwd) {
+          await fs.rm(path.join(step.cwd, PACKAGE_LIFECYCLE_PENDING_RELATIVE_PATH));
+        }
+        return {
+          name: step.name,
+          command: step.argv.join(" "),
+          cwd: step.cwd!,
+          durationMs: 0,
+          exitCode: 0,
+        };
+      },
+      {
+        beforeVerifyCandidate: async (root) => {
+          await expect(
+            fs.readFile(path.join(root, PACKAGE_LIFECYCLE_PENDING_RELATIVE_PATH), "utf8"),
+          ).resolves.toBe(pendingBytes);
+          nodeRunner = selectedNode;
+          admitted = true;
+        },
+        resolveLifecycleNodeRunner: () => nodeRunner,
+      },
+    );
+    expect(result.failedStep).toBeNull();
+    expect(lifecycleCalls).toEqual(["npm-package-preinstall", "npm-package-postinstall"]);
+    expect(result.afterVersion).toBe("2.0.0");
+  });
+
   it("does not activate after a zero-exit output-limited postinstall", async () => {
     const fixture = await createFixture();
     const { result } = await runUpdate(
@@ -181,6 +256,7 @@ describe("runGlobalPackageUpdateSteps lifecycle ownership", () => {
     "retains the exact pending candidate with an uncertain %s lock",
     async (shape) => {
       const fixture = await createFixture();
+      fixture.params.workTimeoutMs = null;
       const { result, stage, lifecycleCalls } = await runUpdate(fixture, async (packageRoot) => {
         await writeUncertainLock(packageRoot, shape);
       });

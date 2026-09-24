@@ -331,20 +331,19 @@ their own environment retain an isolated catalog worker for that environment.
 Provider-discovery entries use the exact selected runtime instance's captured
 source when it is already loaded, so discovery does not create a second copy of
 the same plugin package. Standalone discovery keeps its own setup lifetime.
-Each worker can reuse a prepared catalog generation for each configured agent.
-Base generations and exact provider-discovery registries share a worker-wide
-budget of 32 retained entries, rather than a separate allowance for every agent.
-Successful requests refresh their entries' recency; once their work settles,
-the worker releases the least recently used entries until it meets the budget.
-Retiring a base generation also retires its discovery registries. A replacement
-can temporarily add one base and one discovery entry before the previous entries
-are released. Larger working sets can therefore rebuild evicted entries, while
-smaller sets can reuse more than four discovery scopes for an agent. Authentication
-and provider catalog hooks still refresh on every request.
-The budget counts retained registries, not bytes: plugin sizes differ, and Node
-can retain imported native ESM code after a registry is released. Successfully
-disposed registrations leave their plugin caches; the worker's source inventory
-and existing retirement lifecycle remain authoritative.
+Each worker retains one plugin registration context, shared by agents with the
+same configuration, environment, plugin inventory, and loader workspace. Agent
+credentials and configured model facts travel with each request; catalog jobs do
+not rebuild the agent workspace. Discovery reuses the registrations already
+acquired by that context. Replacement releases them after admitted work settles.
+Successfully disposed registrations leave their plugin caches.
+
+Catalog observation is passive. Inventory requests can ask the catalog owner to
+renew expired providers while returning its accepted rows. Chat metadata and
+session projections only observe publication, so a refresh cannot schedule itself
+through its own notifications. Selected native-model discovery has an independent
+acquisition owner and does not wait for provider inventory renewal. Both owners
+merge their results with the latest accepted counterpart before publication.
 Catalog workers use a 512 MiB V8 old-generation limit rather than inheriting the
 Gateway's default heap budget. Explicit process-wide heap flags override this
 limit; native and external allocations are outside it.

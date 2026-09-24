@@ -1,13 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
-import { performance } from "node:perf_hooks";
 import { threadId } from "node:worker_threads";
 import { expect, it, vi } from "vitest";
+import { createDeferred, withTestTimeout } from "../../test/helpers/promise.js";
 import { saveAuthProfileStore } from "./auth-profiles/store-runtime.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
+import type { ModelCatalogSnapshot } from "./model-catalog.types.js";
 import { getPreparedModelCatalogWorkerPoolSnapshot } from "./prepared-model-catalog-worker.js";
 import {
-  EXTERNAL_AUTH_PROFILE_ID,
+  EXTERNAL_AUTH_PROFILE_ID as EXTERNAL_ID,
   PROVIDER_ID,
 } from "./prepared-model-catalog-worker.test-support.js";
 import {
@@ -15,312 +16,254 @@ import {
   loadPreparedModelRuntimeAuth,
 } from "./prepared-model-runtime-auth.js";
 import { closePreparedModelRuntimeSnapshots } from "./prepared-model-runtime.lifecycle.js";
+import { registerPreparedModelRuntimePublicationListener } from "./prepared-model-runtime.publication-events.js";
+import { readCatalogCaptureFootprint } from "./test-helpers/catalog-capture-footprint.js";
 import { createCatalogFleetFixture } from "./test-helpers/prepared-model-catalog-fleet-fixture.js";
-import {
-  loadCompletedFullCatalog,
-  readCatalogDiscoveryCaptures,
-  usePreparedCatalogWorkerFixtures,
-} from "./test-helpers/prepared-model-catalog-worker-fixture.js";
+import { usePreparedCatalogWorkerFixtures } from "./test-helpers/prepared-model-catalog-worker-fixture.js";
 
 const { makeTempDir } = usePreparedCatalogWorkerFixtures();
 const createFleetFixture = createCatalogFleetFixture(makeTempDir);
 
-it(
-  "reuses exact discovery scopes across agents while reading fresh credentials",
-  async () => {
-    const fleetProof = process.env.OPENCLAW_CATALOG_FLEET_PROOF === "1";
-    const started = performance.now();
-    vi.stubEnv("CODEX_HOME", makeTempDir("openclaw-reuse-empty-codex-"));
-    const agentIds = Array.from(
-      { length: fleetProof ? 28 : 2 },
-      (_, index) => `fleet-${index < 26 ? String.fromCharCode(97 + index) : index + 1}`,
-    );
-    const providerIds = Array.from({ length: 6 }, (_, index) => `worker-reuse-${index}`);
-    const profileId = (provider: string) => `${provider}:reuse`;
-    const credential = (agentId: string, revision: string) => `synthetic-${agentId}-${revision}`;
-    const checkRetainedPayload = fleetProof
-      ? `if (retainedPayload && retainedPayload[0] !== 7) throw new Error("Lost retained fixture payload");`
-      : "";
-    const writeAuth = (stateDir: string, revision: string) => {
-      for (const agentId of agentIds) {
-        const profiles: AuthProfileStore["profiles"] = {
-          [`fleet:${agentId}`]: {
-            type: "api_key",
-            provider: "fleet-proof",
-            key: `synthetic-${agentId}`,
-          },
-        };
-        for (const provider of providerIds) {
-          profiles[profileId(provider)] = {
-            type: "api_key",
-            provider,
-            key: credential(agentId, revision),
-          };
-        }
-        saveAuthProfileStore(
-          { version: 1, profiles },
-          path.join(stateDir, "agents", agentId, "agent"),
-        );
+it("reuses expanded provider scopes across agents while keeping auth request-local", async () => {
+  vi.stubEnv("CODEX_HOME", makeTempDir("openclaw-reuse-empty-codex-"));
+  const agentIds = ["fleet-a", "fleet-b"];
+  const providerIds = ["worker-reuse-0", "worker-reuse-1", "worker-reuse-2"];
+  const profileId = (provider: string) => `${provider}:reuse`;
+  const credential = (agentId: string) => `synthetic-${agentId}`;
+  const fixture = await createFleetFixture(
+    (seed) => {
+      const bundledRoot = path.join(seed.root, "bundled");
+      const fixtureEnv: NodeJS.ProcessEnv = seed.env;
+      fs.mkdirSync(bundledRoot);
+      // Nonbundled providers all enter the runtime-augment base, masking scope expansion.
+      for (const [name, value] of Object.entries({
+        OPENCLAW_DISABLE_BUNDLED_PLUGINS: "0",
+        OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
+        OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1",
+      })) {
+        fixtureEnv[name] = value;
+        vi.stubEnv(name, value);
       }
-    };
-    const fixture = await createFleetFixture(
-      (seed) => {
-        const registrations = path.join(seed.root, "worker-registrations.jsonl");
-        const executions = path.join(seed.root, "worker-catalog-executions.jsonl");
-        const weightedMarker = path.join(seed.root, "weighted-registrations");
-        const bundledRoot = path.join(seed.root, "bundled");
-        const fixtureEnv: NodeJS.ProcessEnv = seed.env;
-        fs.mkdirSync(bundledRoot);
-        // Nonbundled provider plugins are always eligible for runtime augmentation,
-        // which would put every fixture in the base registry and hide scope churn.
-        for (const [name, value] of Object.entries({
-          OPENCLAW_DISABLE_BUNDLED_PLUGINS: "0",
-          OPENCLAW_BUNDLED_PLUGINS_DIR: bundledRoot,
-          OPENCLAW_TEST_TRUST_BUNDLED_PLUGINS_DIR: "1",
-        })) {
-          fixtureEnv[name] = value;
-          vi.stubEnv(name, value);
-        }
-        const recordRegistration = (pluginId: string) => `
-    ${fleetProof ? `const retainedPayload = require("node:worker_threads").threadId !== ${threadId} && fs.existsSync(${JSON.stringify(weightedMarker)}) ? new Array(1024 * 1024).fill(7) : undefined;` : ""}
+      const record = (file: string, fields: string) => `
     if (require("node:worker_threads").threadId !== ${threadId}) {
-      fs.appendFileSync(${JSON.stringify(registrations)}, JSON.stringify({
-        pluginId: ${JSON.stringify(pluginId)}, filename: __filename,
-        ${fleetProof ? "weighted: retainedPayload !== undefined," : ""}
-      }) + "\\n");
+      fs.appendFileSync(${JSON.stringify(path.join(seed.root, file))},
+        JSON.stringify({ ${fields} }) + "\\n");
     }`;
-        // Module paths can remain cached even when the worker reconstructs their registries.
-        // Record registration, rather than module evaluation, to expose both eviction loops.
-        const baseEntry = path.join(seed.root, "plugin", "index.cjs");
-        fs.writeFileSync(
-          baseEntry,
-          fs
-            .readFileSync(baseEntry, "utf8")
-            .replace("  register(api) {", `  register(api) {${recordRegistration(PROVIDER_ID)}`)
-            .replace("run(context) {", `run(context) {${checkRetainedPayload}`),
+      const registration = (provider: string) =>
+        record(
+          "registrations.jsonl",
+          `provider: ${JSON.stringify(provider)}, filename: __filename`,
         );
-        for (const provider of providerIds) {
-          const directory = path.join(bundledRoot, provider);
-          fs.mkdirSync(directory);
-          const entry = path.join(directory, "index.cjs");
-          fs.writeFileSync(
-            entry,
-            `const fs = require("node:fs");
+      const execution = (provider: string) =>
+        record(
+          "executions.jsonl",
+          `provider: ${JSON.stringify(provider)}, agentDir: context.agentDir`,
+        );
+      fs.writeFileSync(path.join(seed.root, "executions.jsonl"), "");
+      // Module evaluation alone misses fresh registries built from retained source modules.
+      const baseEntry = path.join(seed.root, "plugin", "index.cjs");
+      fs.writeFileSync(
+        baseEntry,
+        fs
+          .readFileSync(baseEntry, "utf8")
+          // This proof has only provider publication, not a second native acquisition.
+          .replace(/      loadModelCatalog: async \(\) => \{[\s\S]*?\n      \},\n/u, "")
+          .replace("  register(api) {", `  register(api) {${registration(PROVIDER_ID)}`)
+          .replace("run(context) {", `run(context) {${execution(PROVIDER_ID)}`),
+      );
+      for (const provider of providerIds) {
+        const directory = path.join(bundledRoot, provider);
+        fs.mkdirSync(directory);
+        fs.writeFileSync(
+          path.join(directory, "index.cjs"),
+          `const fs = require("node:fs");
 module.exports = { id: ${JSON.stringify(provider)}, register(api) {
-  ${recordRegistration(provider)}
+  ${registration(provider)}
   api.registerProvider({
     id: ${JSON.stringify(provider)}, label: "Scoped reuse fixture", auth: [],
     catalog: { run(context) {
-      ${checkRetainedPayload}
-      fs.appendFileSync(${JSON.stringify(executions)}, JSON.stringify({
-        provider: ${JSON.stringify(provider)}, agentDir: context.agentDir,
-        threadId: require("node:worker_threads").threadId,
-        ${fleetProof ? 'heap: require("node:v8").getHeapStatistics(), resourceLimits: require("node:worker_threads").resourceLimits, nodeOptions: process.env.NODE_OPTIONS ?? null,' : ""}
-      }) + "\\n");
+      ${execution(provider)}
       const auth = context.resolveProviderApiKey(${JSON.stringify(provider)});
       return { provider: {
         api: "openai-completions", baseUrl: "https://reuse.invalid/v1",
-        models: [{ id: "auth-" + auth.discoveryApiKey, name: "Fresh credential model" }],
+        models: [{ id: "auth-" + auth.discoveryApiKey, name: "Agent credential model" }],
       } };
     } },
   });
 } };
 `,
-          );
-          fs.writeFileSync(
-            path.join(directory, "openclaw.plugin.json"),
-            JSON.stringify({
-              id: provider,
-              providers: [provider],
-              modelCatalog: { discovery: { [provider]: "runtime" } },
-              configSchema: { type: "object", additionalProperties: false },
-            }),
-          );
-          fs.writeFileSync(
-            path.join(directory, "package.json"),
-            JSON.stringify({
-              name: `@openclaw/${provider}`,
-              version: "0.0.0",
-              openclaw: { extensions: ["./index.cjs"] },
-            }),
-          );
-          seed.config.plugins.allow.push(provider);
-          Object.assign(seed.config.plugins.entries, { [provider]: { enabled: true } });
+        );
+        fs.writeFileSync(
+          path.join(directory, "openclaw.plugin.json"),
+          JSON.stringify({
+            id: provider,
+            providers: [provider],
+            modelCatalog: { discovery: { [provider]: "runtime" } },
+            configSchema: { type: "object", additionalProperties: false },
+          }),
+        );
+        fs.writeFileSync(
+          path.join(directory, "package.json"),
+          JSON.stringify({
+            name: `@openclaw/${provider}`,
+            version: "0.0.0",
+            openclaw: { extensions: ["./index.cjs"] },
+          }),
+        );
+        seed.config.plugins.allow.push(provider);
+        Object.assign(seed.config.plugins.entries, { [provider]: { enabled: true } });
+      }
+      for (const agentId of agentIds) {
+        const profiles: AuthProfileStore["profiles"] = {};
+        for (const provider of providerIds) {
+          profiles[profileId(provider)] = { type: "api_key", provider, key: credential(agentId) };
         }
-        writeAuth(seed.env.OPENCLAW_STATE_DIR!, "A");
-      },
-      false,
-      { agentCount: agentIds.length },
-    );
-    const workerCaptures = () =>
-      new Set(
-        readCatalogDiscoveryCaptures(fixture.root)
-          .filter((capture) => capture.threadId !== threadId)
-          .map((capture) => capture.filename),
-      );
-    const captureRoot = () => {
-      const filename = [...workerCaptures()][0]!;
-      return filename.slice(0, filename.indexOf(`${path.sep}openclaw-plugin-build-`));
-    };
-    const captureDirectories = () =>
-      fs.readdirSync(captureRoot()).filter((name) => name.startsWith("openclaw-plugin-build-"));
-    const bytesUnder = (directory: string): number =>
-      fs.readdirSync(directory, { withFileTypes: true }).reduce((bytes, entry) => {
-        const filename = path.join(directory, entry.name);
-        return bytes + (entry.isDirectory() ? bytesUnder(filename) : fs.lstatSync(filename).size);
-      }, 0);
-    const reportFleet = (stage: string) => {
-      if (!fleetProof) {
+        saveAuthProfileStore(
+          { version: 1, profiles },
+          path.join(seed.env.OPENCLAW_STATE_DIR!, "agents", agentId, "agent"),
+        );
+      }
+    },
+    false,
+    { agentCount: agentIds.length },
+  );
+  const registrations = () =>
+    fs
+      .readFileSync(path.join(fixture.root, "registrations.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { provider: string; filename: string });
+  const executions = () =>
+    fs
+      .readFileSync(path.join(fixture.root, "executions.jsonl"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { provider: string; agentDir: string });
+  for (const provider of providerIds) {
+    expect(
+      fixture.snapshots[0]!.metadataSnapshot.plugins.find(({ id }) => id === provider),
+    ).toMatchObject({ origin: "bundled", modelCatalog: { discovery: { [provider]: "runtime" } } });
+  }
+  expect(
+    fixture.snapshots.some((snapshot) =>
+      snapshot.pluginRegistry?.agentHarnesses.some(({ harness }) => harness.loadModelCatalog),
+    ),
+  ).toBe(false);
+  // Auth-only warmup prepares the base without turning a scoped read into full demand.
+  const initialAuth = await loadPreparedModelRuntimeAuth(fixture.snapshots[0]!, {
+    providerIds: [PROVIDER_ID],
+  });
+  expect(initialAuth?.authStore.profiles[EXTERNAL_ID]).toMatchObject({
+    access: "v1:A",
+  });
+  expect(registrations().map(({ provider }) => provider)).toEqual([PROVIDER_ID]);
+  expect(executions()).toEqual([]);
+  const filename = registrations()[0]!.filename;
+  const offset = filename.indexOf(`${path.sep}openclaw-plugin-build-`);
+  expect(offset).toBeGreaterThan(0);
+  const captureRoot = filename.slice(0, offset);
+  expect(path.basename(captureRoot)).toMatch(/^openclaw-model-catalog-/);
+  expect(readCatalogCaptureFootprint(captureRoot).captures).toHaveLength(1);
+  const refreshScope = async (agentIndex: number, provider: string) => {
+    const snapshot = fixture.snapshots[agentIndex]!;
+    const key = credential(agentIds[agentIndex]!);
+    const before = executions().length;
+    const completed = createDeferred<ModelCatalogSnapshot>();
+    // A bounded foreground read may return pending rows; wait for this exact publication.
+    // Equal inventory may retain identity, so identity inequality is not a completion signal.
+    const unsubscribe = registerPreparedModelRuntimePublicationListener((event) => {
+      if (event.phase !== "catalog-published") {
         return;
       }
-      const root = captureRoot();
-      const executionsPath = path.join(fixture.root, "worker-catalog-executions.jsonl");
-      const executions: {
-        threadId: number;
-        heap: { used_heap_size: number; heap_size_limit: number };
-        resourceLimits: { maxOldGenerationSizeMb: number };
-        nodeOptions: string | null;
-      }[] = fs.existsSync(executionsPath)
-        ? fs
-            .readFileSync(executionsPath, "utf8")
-            .trim()
-            .split("\n")
-            .map((line) => JSON.parse(line))
-            .filter((execution: { threadId: number }) => execution.threadId !== threadId)
-        : [];
-      const registrations = fs
-        .readFileSync(path.join(fixture.root, "worker-registrations.jsonl"), "utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as { weighted?: boolean });
-      expect(executions.at(-1)?.resourceLimits.maxOldGenerationSizeMb).toBe(512);
-      expect(executions.at(-1)?.nodeOptions).toBeNull();
-      console.log(
-        JSON.stringify({
-          stage,
-          agents: agentIds.length,
-          scopes: providerIds.length,
-          registrations: registrations.length,
-          weightedRegistrations: registrations.filter(({ weighted }) => weighted).length,
-          capturesRetained: captureDirectories().length,
-          captureBytes: bytesUnder(root),
-          workerHeap: executions.at(-1)?.heap,
-          resourceLimits: executions.at(-1)?.resourceLimits,
-          maxSampledWorkerHeap: Math.max(
-            0,
-            ...executions.map(({ heap }) => heap?.used_heap_size ?? 0),
-          ),
-          rss: process.memoryUsage().rss,
-          elapsedMs: performance.now() - started,
-          pool: getPreparedModelCatalogWorkerPoolSnapshot(),
-        }),
-      );
-    };
-    for (const [index, snapshot] of fixture.snapshots.entries()) {
-      for (const provider of providerIds) {
-        expect(snapshot.metadataSnapshot.plugins.find(({ id }) => id === provider)).toMatchObject({
-          origin: "bundled",
-          modelCatalog: { discovery: { [provider]: "runtime" } },
-        });
+      const catalog = snapshot.readFullModelCatalog!();
+      if (
+        catalog &&
+        !catalog.pendingProviders?.includes(provider) &&
+        catalog.providerOutcomes?.some((outcome) => outcome.provider === provider)
+      ) {
+        completed.resolve(catalog);
       }
-      await loadCompletedFullCatalog(snapshot);
-      if ([0, 3, 12, 27].includes(index)) {
-        reportFleet(`base-${index + 1}`);
-      }
-    }
-    const workerExecutions = () =>
-      fs
-        .readFileSync(path.join(fixture.root, "worker-catalog-executions.jsonl"), "utf8")
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as { provider: string; agentDir: string; threadId: number })
-        .filter((execution) => execution.threadId !== threadId)
-        .map(({ provider, agentDir, threadId: workerThreadId }) => ({
-          provider,
-          agentDir,
-          threadId: workerThreadId,
-        }));
-    const refreshScopes = async (revision: string) => {
-      for (const provider of providerIds) {
-        for (const [index, snapshot] of fixture.snapshots.entries()) {
-          const completedExecutions = workerExecutions().length;
-          await snapshot.loadFullModelCatalog!({ providerIds: [provider], refresh: true });
-          const catalog = await loadCompletedFullCatalog(snapshot);
-          expect(workerExecutions().slice(completedExecutions)).toEqual([
-            { provider, agentDir: snapshot.agentDir, threadId: expect.any(Number) },
-          ]);
-          const key = credential(agentIds[index]!, revision);
-          expect(
-            catalog.entries.filter((entry) => entry.provider === provider).map(({ id }) => id),
-          ).toEqual([`auth-${key}`]);
-          expect(
-            getPreparedModelFullCatalogAuth(catalog)?.authStore.profiles[profileId(provider)],
-          ).toMatchObject({ key });
-          if (fleetProof) {
-            // This fixture shares one base source capture; each retained discovery
-            // owns one additional capture. Real plugins may have different sizes.
-            expect(captureDirectories().length).toBeLessThanOrEqual(33);
-          }
-        }
-      }
-    };
-    await refreshScopes("A");
-    reportFleet("scopes-first-pass");
-    const firstPassCaptureDirectories = captureDirectories();
-    const readRegistrations = () =>
-      fs.readFileSync(path.join(fixture.root, "worker-registrations.jsonl"), "utf8");
-    const registrations = readRegistrations();
-    const registeredPluginIds = new Set(
-      registrations
-        .trim()
-        .split("\n")
-        .map((line) => (JSON.parse(line) as { pluginId: string }).pluginId),
-    );
-    expect(registeredPluginIds).toEqual(new Set([PROVIDER_ID, ...providerIds]));
-    const captures = workerCaptures();
-    expect(captures.size).toBeGreaterThan(0);
-    // Durable auth publication replaces the snapshot itself. External auth refresh
-    // is request-local, so it exercises fresh credentials on these retained owners.
-    fs.writeFileSync(fixture.externalAuthPath, "B");
-    for (const snapshot of fixture.snapshots) {
-      const auth = await loadPreparedModelRuntimeAuth(snapshot, { providerIds: [PROVIDER_ID] });
-      expect(auth?.authStore.profiles[EXTERNAL_AUTH_PROFILE_ID]).toMatchObject({ access: "v1:B" });
-    }
-    await refreshScopes("A");
-    reportFleet("scopes-second-pass");
-    if (!fleetProof) {
-      expect(readRegistrations()).toBe(registrations);
-      expect(workerCaptures()).toEqual(captures);
-    } else {
-      const retained = new Set(captureDirectories());
-      const retired = firstPassCaptureDirectories.filter((directory) => !retained.has(directory));
-      expect(retired.length).toBeGreaterThan(0);
-      console.log(
-        JSON.stringify({
-          stage: "physical-retirement",
-          priorCaptures: firstPassCaptureDirectories.length,
-          retiredCaptures: retired.length,
-          retainedCaptures: retained.size,
-        }),
-      );
-      // Opt-in capacity proof: payloads are synthetic JS arrays retained by each
-      // worker registration's catalog closure, not representative plugin memory.
-      fs.writeFileSync(path.join(fixture.root, "weighted-registrations"), "8 MiB per registration");
-      await refreshScopes("A");
-      reportFleet("weighted-first-pass");
-      await refreshScopes("A");
-      reportFleet("weighted-second-pass");
-    }
-    expect(getPreparedModelCatalogWorkerPoolSnapshot()).toMatchObject({
-      workers: 1,
-      workersCreated: 1,
-      activeTasks: 0,
-      pendingTasks: 0,
     });
-    const root = captureRoot();
-    expect(path.basename(root)).toMatch(/^openclaw-model-catalog-/);
-    await closePreparedModelRuntimeSnapshots();
-    expect(fs.existsSync(root)).toBe(false);
-  },
-  process.env.OPENCLAW_CATALOG_FLEET_PROOF === "1" ? 300_000 : undefined,
-);
+    try {
+      const [, catalog] = await withTestTimeout(
+        Promise.all([
+          snapshot.loadFullModelCatalog!({ providerIds: [provider], refresh: true }),
+          completed.promise,
+        ]),
+        30_000,
+        `Scoped catalog did not publish: ${snapshot.agentId}/${provider}`,
+      );
+      expect(catalog.refreshFailed).toBeFalsy();
+      expect(executions().slice(before)).toEqual([{ provider, agentDir: snapshot.agentDir }]);
+      expect(
+        catalog.entries.filter((entry) => entry.provider === provider).map(({ id }) => id),
+      ).toEqual([`auth-${key}`]);
+      expect(
+        getPreparedModelFullCatalogAuth(catalog)?.authStore.profiles[profileId(provider)],
+      ).toMatchObject({ key });
+    } finally {
+      unsubscribe();
+    }
+  };
+  for (const [index, provider] of providerIds.entries()) {
+    const before = registrations().length;
+    await refreshScope(index % 2, provider);
+    // A new provider rebuilds the growing union once, never an unrelated future scope.
+    expect(
+      registrations()
+        .slice(before)
+        .map((entry) => entry.provider)
+        .toSorted(),
+    ).toEqual([PROVIDER_ID, ...providerIds.slice(0, index + 1)].toSorted());
+    const expanded = registrations();
+    const footprint = readCatalogCaptureFootprint(captureRoot);
+    // Bundled JavaScript keeps process identity; only the nonbundled base is captured.
+    expect(footprint.captures).toHaveLength(1);
+    await refreshScope((index + 1) % 2, provider);
+    expect(registrations()).toEqual(expanded);
+    expect(readCatalogCaptureFootprint(captureRoot)).toEqual(footprint);
+  }
+  const warmedRegistrations = registrations();
+  const warmedFootprint = readCatalogCaptureFootprint(captureRoot);
+  expect(warmedFootprint.bytes).toBeGreaterThan(0);
+  const refreshedAuth = [];
+  for (const [index, snapshot] of fixture.snapshots.entries()) {
+    // External refresh is request-local; durable auth writes would replace these owners.
+    const token = index === 0 ? "B" : "C";
+    fs.writeFileSync(fixture.externalAuthPath, token);
+    const auth = await loadPreparedModelRuntimeAuth(snapshot, { providerIds: [PROVIDER_ID] });
+    expect(auth?.authStore.profiles[EXTERNAL_ID]).toMatchObject({
+      access: `v1:${token}`,
+    });
+    for (const provider of providerIds) {
+      expect(auth?.authStore.profiles[profileId(provider)]).toMatchObject({
+        key: credential(agentIds[index]!),
+      });
+    }
+    refreshedAuth.push(auth);
+  }
+  expect(initialAuth?.authStore.profiles[EXTERNAL_ID]).toMatchObject({
+    access: "v1:A",
+  });
+  expect(refreshedAuth[0]?.authStore.profiles[EXTERNAL_ID]).toMatchObject({
+    access: "v1:B",
+  });
+  expect(executions()).toHaveLength(providerIds.length * agentIds.length);
+  for (const provider of providerIds.toReversed()) {
+    for (const agentIndex of [1, 0]) {
+      await refreshScope(agentIndex, provider);
+      expect(registrations()).toEqual(warmedRegistrations);
+      expect(readCatalogCaptureFootprint(captureRoot)).toEqual(warmedFootprint);
+    }
+  }
+  expect(getPreparedModelCatalogWorkerPoolSnapshot()).toMatchObject({
+    workers: 1,
+    workersCreated: 1,
+    activeTasks: 0,
+    pendingTasks: 0,
+  });
+  await closePreparedModelRuntimeSnapshots();
+  expect(fs.existsSync(captureRoot)).toBe(false);
+});
