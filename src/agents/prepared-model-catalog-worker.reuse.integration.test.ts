@@ -87,7 +87,7 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
       return { provider: {
         api: "openai-completions", baseUrl: "https://reuse.invalid/v1",
         models: [{ id: "auth-" + auth.discoveryApiKey, name: "Agent credential model" }],
-      } };
+      }, outcomes: [{ provider: ${JSON.stringify(provider)}, status: "ready" }] };
     } },
   });
 } };
