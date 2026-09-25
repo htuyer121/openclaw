@@ -67,7 +67,7 @@ it("reuses expanded provider scopes across agents while keeping auth request-loc
         fs
           .readFileSync(baseEntry, "utf8")
           // This proof has only provider publication, not a second native acquisition.
-          .replace(/      loadModelCatalog: async \(\) => \{[\s\S]*?\n      \},\n/u, "")
+          .replace(/ {6}loadModelCatalog: async \(\) => \{[\s\S]*?\n {6}\},\n/u, "")
           .replace("  register(api) {", `  register(api) {${registration(PROVIDER_ID)}`)
           .replace("run(context) {", `run(context) {${execution(PROVIDER_ID)}`),
       );
@@ -125,7 +125,7 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
       }
     },
     false,
-    { agentCount: agentIds.length },
+    { agentCount: agentIds.length, publication: "individual" },
   );
   const registrations = () =>
     fs
@@ -148,10 +148,13 @@ module.exports = { id: ${JSON.stringify(provider)}, register(api) {
   }
   expect(
     fixture.snapshots.some((snapshot) =>
-      snapshot.pluginRegistry?.agentHarnesses.some(({ harness }) => harness.loadModelCatalog),
+      snapshot.pluginRegistry?.agentHarnesses.some(
+        ({ harness }) => typeof harness.loadModelCatalog === "function",
+      ),
     ),
   ).toBe(false);
-  // Auth-only warmup prepares the base without turning a scoped read into full demand.
+  // Individual publication avoids the fleet lifecycle's eager changed-provider renewal.
+  // Auth-only warmup then prepares the base without turning a scoped read into full demand.
   const initialAuth = await loadPreparedModelRuntimeAuth(fixture.snapshots[0]!, {
     providerIds: [PROVIDER_ID],
   });
