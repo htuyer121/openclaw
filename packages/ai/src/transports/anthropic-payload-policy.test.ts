@@ -291,7 +291,9 @@ describe("Anthropic stable-history cache boundaries", () => {
   });
 
   it("never exceeds the four-marker budget, counting OAuth system blocks", () => {
-    const system = buildAnthropicSystemBlocks("stable prompt", true, ephemeral) ?? [];
+    const system = (buildAnthropicSystemBlocks("stable prompt", true, ephemeral) ?? []).map(
+      (block) => Object.fromEntries(Object.entries(block)),
+    );
     for (const messages of [twoTurns, [...twoTurns, toolCall("t1"), toolResult("t1")]]) {
       const payload = allocate(messages, {
         system,
