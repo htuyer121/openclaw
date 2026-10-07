@@ -462,7 +462,7 @@ describe("Anthropic provider", () => {
           content: "summary checkpoint",
           encrypted_content: encryptedContent,
         },
-        { type: "text", text: "Done." },
+        { type: "text", text: "Done.", cache_control: { type: "ephemeral" } },
       ]);
     },
   );
@@ -669,7 +669,7 @@ describe("Anthropic provider", () => {
     );
     expect(payload.thinking).toBeUndefined();
     expect(assistantContent(payload)).toEqual([
-      { type: "text", text: "[assistant reasoning omitted]" },
+      { type: "text", text: "[assistant reasoning omitted]", cache_control: { type: "ephemeral" } },
     ]);
   });
 
@@ -1237,7 +1237,9 @@ describe("Anthropic provider", () => {
       ),
     );
     const assistant = wireMessages(payload).find((message) => message.role === "assistant");
-    expect(assistant?.content).toEqual([{ type: "text", text: "visible answer" }]);
+    expect(assistant?.content).toEqual([
+      { type: "text", text: "visible answer", cache_control: { type: "ephemeral" } },
+    ]);
     expect(JSON.stringify(assistant)).not.toContain("sig_model_bound");
   });
 

@@ -316,7 +316,92 @@ function stripAnthropicSystemPromptBoundary(system: unknown): void {
   }
 }
 
-/** Apply one shared deepest-stable-message cache breakpoint policy. */
+function isUserMessageRecord(message: unknown): message is Record<string, unknown> {
+  return isRecord(message) && message.role === "user";
+}
+
+/** A user message starts a turn when it carries text or an image, not only tool results. */
+function carriesUserTurnContent(message: Record<string, unknown>): boolean {
+  const { content } = message;
+  if (typeof content === "string") {
+    return content.length > 0;
+  }
+  return (
+    Array.isArray(content) &&
+    content.some((block) => isRecord(block) && (block.type === "text" || block.type === "image"))
+  );
+}
+
+/**
+ * Last block of the assistant message at `index` that may carry a breakpoint. Only non-empty
+ * text and tool_use qualify; thinking and server-side compaction blocks never take cache_control.
+ */
+function findAssistantCacheableTail(
+  messages: ReadonlyArray<unknown>,
+  index: number,
+): Record<string, unknown> | undefined {
+  const message = messages[index];
+  if (!isRecord(message) || message.role !== "assistant" || !Array.isArray(message.content)) {
+    return undefined;
+  }
+  for (let i = message.content.length - 1; i >= 0; i--) {
+    const block = message.content[i];
+    if (
+      isRecord(block) &&
+      (block.type === "tool_use" ||
+        (block.type === "text" && typeof block.text === "string" && block.text.length > 0))
+    ) {
+      return block;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Stable history boundaries, newest first: the end of the assistant message before the newest
+ * user turn (written now) and before the turn preceding it (the boundary the previous request
+ * wrote). A turn is a run of consecutive user messages, so a runtime-context carrier belongs to
+ * the turn it follows. Everything before the newest turn replays byte-stable, while the newest
+ * turn's own messages are re-rendered between requests. Opted-out messages (ephemeral
+ * context appended to the newest request only) never start a turn.
+ */
+function findStableHistoryBoundaries(
+  messages: ReadonlyArray<unknown>,
+  cacheBreakpointOptOutMessageIndexes: ReadonlySet<number>,
+): Record<string, unknown>[] {
+  const boundaries: Record<string, unknown>[] = [];
+  let turns = 0;
+  let i = messages.length - 1;
+  while (i >= 0 && turns < 2) {
+    if (!isUserMessageRecord(messages[i])) {
+      i--;
+      continue;
+    }
+    let startsTurn = false;
+    for (; i >= 0; i--) {
+      const message = messages[i];
+      if (!isUserMessageRecord(message)) {
+        break;
+      }
+      startsTurn ||= !cacheBreakpointOptOutMessageIndexes.has(i) && carriesUserTurnContent(message);
+    }
+    if (startsTurn) {
+      turns++;
+      const boundary = findAssistantCacheableTail(messages, i);
+      if (boundary) {
+        boundaries.push(boundary);
+      }
+    }
+  }
+  return boundaries;
+}
+
+/**
+ * Allocate message breakpoints in priority order: the advancing tool-result checkpoint, then
+ * the stable history boundaries, then the newest user block. Each request writes the entry the
+ * next request reads at its previous boundary, so history stays cached even though the newest
+ * turn's tail does not replay identically.
+ */
 function applyAnthropicCacheControlToMessages(
   messages: unknown,
   cacheControl: AnthropicEphemeralCacheControl,
@@ -327,68 +412,49 @@ function applyAnthropicCacheControlToMessages(
     return;
   }
 
-  let fallbackToolResult: Record<string, unknown> | undefined;
+  let toolResult: Record<string, unknown> | undefined;
+  let newestUserBlock: Record<string, unknown> | undefined;
+  let newestUserString: Record<string, unknown> | undefined;
 
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (!message || typeof message !== "object") {
+  for (let i = messages.length - 1; i >= 0 && !newestUserBlock && !newestUserString; i--) {
+    const record = messages[i];
+    if (!isUserMessageRecord(record) || cacheBreakpointOptOutMessageIndexes.has(i)) {
       continue;
     }
-
-    const record = message as Record<string, unknown>;
-    if (record.role !== "user" || cacheBreakpointOptOutMessageIndexes.has(i)) {
-      continue;
-    }
-
     const content = record.content;
     if (typeof content === "string") {
-      if (fallbackToolResult && markerLimit === 1) {
-        fallbackToolResult.cache_control = cacheControl;
-        return;
-      }
-      record.content = [
-        {
-          type: "text",
-          text: content,
-          cache_control: cacheControl,
-        },
-      ];
-      if (fallbackToolResult && markerLimit > 1) {
-        fallbackToolResult.cache_control = cacheControl;
-      }
-      return;
+      newestUserString = record;
+      continue;
     }
-
     if (!Array.isArray(content)) {
       continue;
     }
-
-    for (let j = content.length - 1; j >= 0; j--) {
+    for (let j = content.length - 1; j >= 0 && !newestUserBlock; j--) {
       const block = content[j];
-      if (!block || typeof block !== "object") {
+      if (!isRecord(block)) {
         continue;
       }
-
-      const blockRecord = block as Record<string, unknown>;
-      if (blockRecord.type === "text" || blockRecord.type === "image") {
-        if (fallbackToolResult && markerLimit === 1) {
-          fallbackToolResult.cache_control = cacheControl;
-          return;
-        }
-        blockRecord.cache_control = cacheControl;
-        if (fallbackToolResult && markerLimit > 1) {
-          fallbackToolResult.cache_control = cacheControl;
-        }
-        return;
-      }
-      if (blockRecord.type === "tool_result" && fallbackToolResult === undefined) {
-        fallbackToolResult = blockRecord;
+      if (block.type === "text" || block.type === "image") {
+        newestUserBlock = block;
+      } else if (block.type === "tool_result" && toolResult === undefined) {
+        toolResult = block;
       }
     }
   }
 
-  if (fallbackToolResult) {
-    fallbackToolResult.cache_control = cacheControl;
+  const targets = [
+    toolResult,
+    ...findStableHistoryBoundaries(messages, cacheBreakpointOptOutMessageIndexes),
+    newestUserBlock,
+  ].filter((block) => block !== undefined);
+  const selected = targets.slice(0, markerLimit);
+  for (const block of selected) {
+    block.cache_control = cacheControl;
+  }
+  if (newestUserString && selected.length < markerLimit) {
+    newestUserString.content = [
+      { type: "text", text: newestUserString.content, cache_control: cacheControl },
+    ];
   }
 }
 

@@ -170,14 +170,17 @@ describe("anthropic payload policy", () => {
       textBlock("Follow policy.", { type: "ephemeral", ttl: "1h" }),
       textBlock("Use tools carefully.", { type: "ephemeral", ttl: "1h" }),
     ]);
+    // Two system markers leave two message slots: the tool result and the stable boundary.
     expect(payload.messages[0]).toEqual({
       role: "assistant",
-      content: [{ type: "text", text: "Working." }],
+      content: [
+        { type: "text", text: "Working.", cache_control: { type: "ephemeral", ttl: "1h" } },
+      ],
     });
     expect(payload.messages[1]).toEqual({
       role: "user",
       content: [
-        { type: "text", text: "Hello", cache_control: { type: "ephemeral", ttl: "1h" } },
+        { type: "text", text: "Hello" },
         {
           type: "tool_result",
           tool_use_id: "tool_1",

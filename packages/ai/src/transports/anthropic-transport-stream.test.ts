@@ -536,7 +536,7 @@ describe("anthropic transport stream", () => {
         content: "summary checkpoint",
         encrypted_content: "opaque-final-compaction",
       },
-      { type: "text", text: "Done." },
+      { type: "text", text: "Done.", cache_control: { type: "ephemeral" } },
     ]);
     const pressure = resolveCompactionReplayPressure(
       resumed,
@@ -1685,7 +1685,7 @@ describe("anthropic transport stream", () => {
         thinking: "Need context.",
         signature: "reasoning_content",
       },
-      { type: "text", text: "Visible answer. Continued." },
+      { type: "text", text: "Visible answer. Continued.", cache_control: { type: "ephemeral" } },
     ]);
   });
 
@@ -2023,8 +2023,14 @@ describe("anthropic transport stream", () => {
       .map((msg) => requireRecord(msg, "message"))
       .filter((msg) => msg.role === "assistant");
     expect(assistants.map((msg) => msg.content)).toEqual([
-      [{ type: "text", text: "[assistant reasoning omitted]" }],
-      [{ type: "text", text: "Visible reply." }],
+      [
+        {
+          type: "text",
+          text: "[assistant reasoning omitted]",
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      [{ type: "text", text: "Visible reply.", cache_control: { type: "ephemeral" } }],
       [
         { type: "thinking", thinking: "call lookup", signature: "sig_tool" },
         { type: "tool_use", id: "call_1", name: "lookup", input: {} },
@@ -2099,7 +2105,13 @@ describe("anthropic transport stream", () => {
     expect(assistants[0]).not.toHaveProperty("reasoning_text");
     expect(assistants[1]?.content).toEqual([
       { type: "thinking", thinking: "", signature: "reasoning_content" },
-      { type: "tool_use", id: "call_1", name: "lookup", input: {} },
+      {
+        type: "tool_use",
+        id: "call_1",
+        name: "lookup",
+        input: {},
+        cache_control: { type: "ephemeral" },
+      },
     ]);
     expect(assistants[1]).not.toHaveProperty("reasoning_content");
     expect(payload).not.toHaveProperty("thinking");
