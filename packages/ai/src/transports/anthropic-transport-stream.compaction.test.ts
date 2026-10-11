@@ -170,7 +170,7 @@ describe("anthropic transport stream compaction", () => {
         content: "summary checkpoint",
         encrypted_content: "opaque-final-compaction",
       },
-      { type: "text", text: "Done." },
+      { type: "text", text: "Done.", cache_control: { type: "ephemeral" } },
     ]);
     const pressure = resolveCompactionReplayPressure(
       resumed,
