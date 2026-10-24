@@ -20,8 +20,10 @@ export function parseTeamShapeOptions(argv: string[]) {
       "state-dir": { type: "string" },
       sessions: { type: "string" },
       runs: { type: "string" },
+      "settled-runs": { type: "boolean" },
       approvals: { type: "string" },
       cron: { type: "string" },
+      "cron-announce-last": { type: "boolean" },
       projects: { type: "string" },
       seed: { type: "string" },
       now: { type: "string" },
@@ -30,6 +32,7 @@ export function parseTeamShapeOptions(argv: string[]) {
       "long-transcript-sessions": { type: "string" },
       "worktree-files": { type: "string" },
       "nested-repository": { type: "boolean" },
+      "github-options-connected": { type: "boolean" },
       port: { type: "string" },
       launch: { type: "boolean" },
       help: { type: "boolean" },
@@ -54,6 +57,11 @@ export function parseTeamShapeOptions(argv: string[]) {
   if (retainedRuns > 0 && sessions < 2) {
     throw new Error("--runs requires at least two sessions (parent and child)");
   }
+  const cronJobs = integer("cron", 100);
+  const cronAnnounceLast = values["cron-announce-last"] ?? false;
+  if (cronAnnounceLast && (sessions < 2 || cronJobs === 0)) {
+    throw new Error("--cron-announce-last requires at least two sessions and one cron job");
+  }
   const transcriptBytes = integer("transcript-mib", 64) * 1024 * 1024;
   if (!Number.isSafeInteger(transcriptBytes)) {
     throw new Error("--transcript-mib exceeds the safe byte range");
@@ -75,12 +83,17 @@ export function parseTeamShapeOptions(argv: string[]) {
   if ((worktreeFiles > 0 || values["nested-repository"]) && projects === 0) {
     throw new Error("--worktree-files and --nested-repository require at least one project");
   }
+  if (values["github-options-connected"] && projects === 0) {
+    throw new Error("--github-options-connected requires at least one project");
+  }
   return {
     stateDir: path.resolve(values["state-dir"] ?? "."),
     sessions,
     retainedRuns,
+    settledRuns: values["settled-runs"] ?? false,
     approvals: integer("approvals", 200),
-    cronJobs: integer("cron", 100),
+    cronJobs,
+    cronAnnounceLast,
     projects,
     seed: integer("seed", 967),
     now: integer("now", Date.parse("2026-10-13T12:00:00Z"), 1),
@@ -89,6 +102,7 @@ export function parseTeamShapeOptions(argv: string[]) {
     longTranscriptSessions,
     worktreeFiles,
     nestedRepository: values["nested-repository"] ?? false,
+    githubOptionsConnected: values["github-options-connected"] ?? false,
     port,
     launch: values.launch ?? false,
     help: values.help ?? false,
@@ -140,7 +154,6 @@ export async function generateTeamShapeFixture(options: ReturnType<typeof parseT
       cron: { enabled: false },
       update: { checkOnStart: false },
       agents: {
-        defaults: { heartbeat: { every: "0m" } },
         entries: { main: { workspace: path.join(stateDir, "workspace") } },
       },
       logging: { file: path.join(stateDir, "gateway.log") },
@@ -197,9 +210,12 @@ async function main() {
   if (options.help) {
     console.log(`Usage: node --import ./scripts/tsx.mjs scripts/perf/team-shape-fixture.ts --state-dir <new-dir> [options]
   --sessions 5000 --runs 6000 --approvals 200 --cron 100 --projects 12
+  --settled-runs           Keep run history terminal and delivered, without a subagent recovery backlog.
+  --cron-announce-last     Seed disabled isolated cron jobs with announce/last delivery.
   --seed 967 --now <epoch-ms> --transcript-mib 64
   --long-transcript-entries 0 --long-transcript-sessions 4
   --worktree-files 0 --nested-repository
+  --github-options-connected  Register synthetic GitHub origins for dashboard measurements.
   --launch --port 40967    Start an isolated loopback dev Gateway after generation.
 State is synthetic and must not exist. Existing state is never overwritten.
 Transcript MiB is logical text before compression; actual database sizes are reported.

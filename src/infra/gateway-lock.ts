@@ -109,8 +109,6 @@ function resolveGatewayOwnerStatusSync(
   pid: number,
   payload: LockPayload | null,
   platform: NodeJS.Platform,
-  readCmdline?: (pid: number) => string[] | null,
-  readStartTime?: (pid: number) => number | null,
   opts: {
     trustUnknownCmdlineOwner?: boolean;
     deadlineMs?: number;
@@ -128,7 +126,7 @@ function resolveGatewayOwnerStatusSync(
     return Math.max(1, Math.min(CMDLINE_EXEC_TIMEOUT_MS, Math.ceil(remaining)));
   };
   remainingTimeoutMs();
-  const namespace = classifyGatewayLockProcessNamespace(payload?.processNamespace, opts.lockPath);
+  const namespace = classifyGatewayLockProcessNamespace(payload, opts.lockPath);
   if (namespace !== "same") {
     return namespace;
   }
@@ -141,24 +139,16 @@ function resolveGatewayOwnerStatusSync(
   // process has the same argv shape.
   const payloadStartTime = payload?.startTime;
   if (Number.isFinite(payloadStartTime)) {
-    const currentStartTime = (
-      readStartTime ??
-      ((ownerPid) => readGatewayLockProcessStartTime(ownerPid, platform, remainingTimeoutMs()))
-    )(pid);
+    const currentStartTime = readGatewayLockProcessStartTime(pid, platform, remainingTimeoutMs());
     remainingTimeoutMs();
     if (currentStartTime != null) {
       return currentStartTime === payloadStartTime ? "alive" : "dead";
     }
   }
 
-  const readFn =
-    readCmdline ??
-    ((p: number) =>
-      readGatewayLockProcessCmdline(p, platform, remainingTimeoutMs(), opts.deadlineMs));
-  const identityOptions = readCmdline ? undefined : { pid };
   const embedded =
     role === "agent-embedded" || role === "sqlite-maintenance" || role === "skill-workshop-apply";
-  const args = readFn(pid);
+  const args = readGatewayLockProcessCmdline(pid, platform, remainingTimeoutMs(), opts.deadlineMs);
   remainingTimeoutMs();
   if (!args) {
     // An unavailable command observation cannot prove that the owner stopped.
@@ -174,10 +164,7 @@ function resolveGatewayOwnerStatusSync(
       : role === "skill-workshop-apply"
         ? "skills"
         : "gateway";
-  const identity = classifyOpenClawArgv(
-    args,
-    command ? { command, ...identityOptions } : identityOptions,
-  );
+  const identity = classifyOpenClawArgv(args, command ? { command, pid } : { pid });
   remainingTimeoutMs();
   return identity.kind === "openclaw" ? "alive" : "unknown";
 }
@@ -233,25 +220,15 @@ function shouldReclaimGatewayLock(params: {
   lockPath: string;
   payload: LockPayload | null;
   platform: NodeJS.Platform;
-  readProcessCmdline?: (pid: number) => string[] | null;
-  readProcessStartTime?: (pid: number) => number | null;
 }): boolean {
-  if (
-    classifyGatewayLockProcessNamespace(params.payload?.processNamespace, params.lockPath) ===
-    "unknown"
-  ) {
+  if (classifyGatewayLockProcessNamespace(params.payload, params.lockPath) === "unknown") {
     throw new GatewayLockNamespaceError(params.payload ?? {}, params.lockPath);
   }
   const ownerPid = params.payload?.pid;
   const ownerStatus = ownerPid
-    ? resolveGatewayOwnerStatusSync(
-        ownerPid,
-        params.payload,
-        params.platform,
-        params.readProcessCmdline,
-        params.readProcessStartTime,
-        { lockPath: params.lockPath },
-      )
+    ? resolveGatewayOwnerStatusSync(ownerPid, params.payload, params.platform, {
+        lockPath: params.lockPath,
+      })
     : "unknown";
   if (ownerPid) {
     return ownerStatus === "dead";
@@ -276,7 +253,7 @@ export function resolveGatewayLockPaths(env: NodeJS.ProcessEnv, suppliedLockDir?
 
 type GatewayLockObservationOptions = Pick<
   GatewayLockOptions,
-  "env" | "lockDir" | "platform" | "readProcessCmdline" | "readProcessStartTime" | "timeoutMs"
+  "env" | "lockDir" | "platform" | "timeoutMs"
 > & { requireInspection?: boolean; signal?: AbortSignal };
 
 type GatewayLockOwnerIdentity = Omit<GatewayLockIdentity, "port"> & { port?: number };
@@ -339,7 +316,7 @@ async function readVerifiedGatewayLockIdentity(
   }
   if (
     opts.requireInspection &&
-    classifyGatewayLockProcessNamespace(payload.processNamespace, lockPath) === "unknown"
+    classifyGatewayLockProcessNamespace(payload, lockPath) === "unknown"
   ) {
     const error = new GatewayLockNamespaceError(payload, lockPath);
     throw new GatewayLockError(error.message, error);
@@ -348,8 +325,6 @@ async function readVerifiedGatewayLockIdentity(
     payload.pid,
     payload,
     opts.platform ?? process.platform,
-    opts.readProcessCmdline,
-    opts.readProcessStartTime,
     { trustUnknownCmdlineOwner: false, deadlineMs, signal: opts.signal, lockPath },
   );
   assertActive();
@@ -384,15 +359,13 @@ async function assertHistoricalGatewayOwnerStopped(
     if (!payload) {
       continue;
     }
-    if (classifyGatewayLockProcessNamespace(payload.processNamespace, lockPath) === "unknown") {
+    if (classifyGatewayLockProcessNamespace(payload, lockPath) === "unknown") {
       throw new GatewayLockNamespaceError(payload, lockPath);
     }
     const owner = await resolveGatewayOwnerStatus(
       payload.pid,
       payload,
       opts.platform ?? process.platform,
-      opts.readProcessCmdline,
-      opts.readProcessStartTime,
       { trustUnknownCmdlineOwner: false, lockPath },
     );
     if (owner !== "dead") {
@@ -431,15 +404,11 @@ export async function acquireGatewayLock(
     0,
   );
   const deadlineMs = Math.min(opts.lifecycleDeadlineMs ?? Infinity, startedAt + timeoutMs);
-  const startTime = (
-    opts.readProcessStartTime ??
-    ((pid) =>
-      readGatewayLockProcessStartTime(
-        pid,
-        opts.platform ?? process.platform,
-        CMDLINE_EXEC_TIMEOUT_MS,
-      ))
-  )(process.pid);
+  const startTime = readGatewayLockProcessStartTime(
+    process.pid,
+    opts.platform ?? process.platform,
+    CMDLINE_EXEC_TIMEOUT_MS,
+  );
   const payload: LockPayload = {
     pid: process.pid,
     ownerId: randomUUID(),
@@ -607,8 +576,6 @@ export async function acquireGatewayLock(
         lockPath: paths.stateLockPath,
         payload: previous,
         platform: opts.platform ?? process.platform,
-        readProcessCmdline: opts.readProcessCmdline,
-        readProcessStartTime: opts.readProcessStartTime,
       });
     if (!borrowedOwner) {
       projection = createGatewayStateProjection(

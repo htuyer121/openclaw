@@ -4,16 +4,11 @@ import type { GatewayBindMode, OpenClawConfig } from "../../config/types.js";
 import { projectGatewayUrlForDiagnostics } from "../../gateway/connection-details.js";
 import { resolveAdvertisedControlUiLinks } from "../../gateway/control-ui-links.js";
 import { trimToUndefined } from "../../gateway/credentials.js";
-import { resolveGatewayRequiredListenHosts } from "../../gateway/net.js";
-import {
-  inspectBestEffortPrimaryTailnetIPv4,
-  resolveBestEffortGatewayBindHostForDisplay,
-} from "../../infra/network-discovery-display.js";
+import { resolveGatewayBindHost, resolveGatewayRequiredListenHosts } from "../../gateway/net.js";
 import { inspectPortUsage, inspectPortUsages } from "../../infra/ports-inspect.js";
 import type { PortUsage } from "../../infra/ports-types.js";
 import { parseTcpPortFromArgs } from "../../infra/tcp-port.js";
 import type { WindowsGatewayFirewallDiagnostic } from "../../infra/windows-gateway-firewall-diagnostics.js";
-import { pickProbeHostForBind } from "./shared.js";
 
 type GatewayStatusSummary = {
   bindMode: GatewayBindMode;
@@ -76,18 +71,22 @@ export async function resolveGatewayStatusSummary(params: {
     params.localPortOverride !== undefined ? "cli" : portFromArgs ? "service args" : "env/config";
   const bindMode: GatewayBindMode = params.daemonCfg.gateway?.bind ?? "loopback";
   const customBindHost = params.daemonCfg.gateway?.customBindHost;
-  const { bindHost, warning: bindHostWarning } = await resolveBestEffortGatewayBindHostForDisplay({
-    bindMode,
-    customBindHost,
-    warningPrefix: "Status is using fallback network details because interface discovery failed",
-  });
-  const { tailnetIPv4, warning: tailnetWarning } = inspectBestEffortPrimaryTailnetIPv4({
-    warningPrefix: "Status could not inspect tailnet addresses",
-  });
-  const probeHost =
-    params.localPortOverride !== undefined
-      ? "127.0.0.1"
-      : pickProbeHostForBind(bindMode, tailnetIPv4, customBindHost);
+  let bindHost: string;
+  let bindHostWarning: string | undefined;
+  try {
+    bindHost = await resolveGatewayBindHost(bindMode, customBindHost);
+  } catch (error) {
+    bindHost =
+      bindMode === "lan"
+        ? "0.0.0.0"
+        : bindMode === "custom"
+          ? customBindHost?.trim() || "0.0.0.0"
+          : "127.0.0.1";
+    const message = error instanceof Error ? error.message.trim() : "";
+    bindHostWarning = `Status is using fallback network details because interface discovery failed: ${message || "network interface discovery failed"}.`;
+  }
+  // The local CLI uses loopback; custom and Tailnet binds also require that listener.
+  const probeHost = "127.0.0.1";
   const probeUrlOverride = trimToUndefined(params.rpcUrlOverride) ?? null;
   const tlsEnabled = params.daemonCfg.gateway?.tls?.enabled === true;
   const scheme = tlsEnabled ? "wss" : "ws";
@@ -110,9 +109,7 @@ export async function resolveGatewayStatusSummary(params: {
         ? "Loopback-only gateway; only local clients can connect."
         : undefined;
   const probeNote = uniqueStrings(
-    [bindNote, bindHostWarning, tailnetWarning].filter((value): value is string =>
-      Boolean(value?.trim()),
-    ),
+    [bindNote, bindHostWarning].filter((value): value is string => Boolean(value?.trim())),
   ).join(" ");
 
   const gateway: GatewayStatusSummary = {

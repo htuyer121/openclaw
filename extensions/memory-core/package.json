@@ -1,6 +1,6 @@
 {
   "name": "@openclaw/memory-core",
-  "version": "2026.10.5",
+  "version": "2026.10.6",
   "private": true,
   "description": "OpenClaw core memory search plugin",
   "type": "module",
@@ -10,7 +10,7 @@
     "./worker-api.js": "./worker-api.ts"
   },
   "dependencies": {
-    "@openclaw/fs-safe": "0.26.8",
+    "@openclaw/fs-safe": "0.26.11",
     "@solidjs/web": "2.0.0-rc.16",
     "solid-js": "2.0.0-rc.16",
     "json5": "2.2.3",
@@ -25,7 +25,7 @@
     "openclaw": "workspace:*"
   },
   "peerDependencies": {
-    "openclaw": ">=2026.10.5"
+    "openclaw": ">=2026.10.6"
   },
   "peerDependenciesMeta": {
     "openclaw": {

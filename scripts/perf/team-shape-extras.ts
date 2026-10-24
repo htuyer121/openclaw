@@ -34,11 +34,14 @@ export type TeamShapeExtrasOptions = {
   stateDir: string;
   sessions: FixtureSession[];
   retainedRuns: number;
+  settledRuns?: boolean;
   approvals: number;
   cronJobs: number;
+  cronAnnounceLast?: boolean;
   projects: number;
   worktreeFiles?: number;
   nestedRepository?: boolean;
+  githubOptionsConnected?: boolean;
   now: number;
 };
 
@@ -54,8 +57,9 @@ function retainedRun(index: number, options: TeamShapeExtrasOptions): SubagentRu
   const startedAt = endedAt - 30_000 - (index % 100) * 1_000;
   const slot = index % 20;
   const failed = slot >= 12 && slot < 15;
-  const pending = slot >= 15 && slot < 18 && index + childCount >= options.retainedRuns;
-  const interrupted = slot >= 18;
+  const pending =
+    !options.settledRuns && slot >= 15 && slot < 18 && index + childCount >= options.retainedRuns;
+  const interrupted = !options.settledRuns && slot >= 18;
   const outcome = failed
     ? { status: "error" as const, error: "Synthetic tool exited with status 1" }
     : { status: "ok" as const };
@@ -142,6 +146,10 @@ async function seedProjects(options: TeamShapeExtrasOptions) {
       executeFile("git", ["-C", repoRoot, ...args], { env: gitEnv });
     await fs.mkdir(repoRoot, { recursive: true });
     await git("init", "--initial-branch=main");
+    if (options.githubOptionsConnected) {
+      // The registry fingerprint includes the origin; set it before registration.
+      await git("remote", "add", "origin", "https://github.com/openclaw-fixture/soak.git");
+    }
     await fs.writeFile(path.join(repoRoot, "README.md"), `# Synthetic project ${index}\n`);
     await git("add", "README.md");
     await git("-c", "commit.gpgSign=false", "commit", "-m", "test: seed synthetic project");
@@ -363,9 +371,19 @@ export async function seedTeamShapeExtras(options: TeamShapeExtrasOptions) {
       index % 2 === 0
         ? { kind: "every", everyMs: 3_600_000, anchorMs: options.now }
         : { kind: "cron", expr: "0 8 * * *", tz: "UTC" },
-    sessionTarget: "main",
     wakeMode: "next-heartbeat",
-    payload: { kind: "systemEvent", text: `Synthetic inspection ${index}` },
+    ...(options.cronAnnounceLast
+      ? {
+          sessionTarget: "isolated" as const,
+          sessionKey: options.sessions[1]!.sessionKey,
+          payload: { kind: "agentTurn" as const, message: `Synthetic inspection ${index}` },
+          delivery: { mode: "announce" as const, channel: "last" },
+          failureAlert: false as const,
+        }
+      : {
+          sessionTarget: "main" as const,
+          payload: { kind: "systemEvent" as const, text: `Synthetic inspection ${index}` },
+        }),
     state: { lastRunAtMs: options.now - DAY_MS, lastRunStatus: index % 5 === 0 ? "error" : "ok" },
   }));
   if (jobs.length > 0) {
@@ -378,10 +396,13 @@ export async function seedTeamShapeExtras(options: TeamShapeExtrasOptions) {
   }
   return {
     retainedRuns: runs.length,
+    settledRuns: options.settledRuns ?? false,
     retainedRunStates,
     approvals: options.approvals,
     cronJobs: jobs.length,
+    cronAnnounceLast: options.cronAnnounceLast ?? false,
     projects: projectWorktrees.length,
+    githubOptionsConnected: options.githubOptionsConnected ?? false,
     worktreeFiles: options.worktreeFiles ?? 0,
     nestedRepository: options.nestedRepository ?? false,
     projectWorktrees,
